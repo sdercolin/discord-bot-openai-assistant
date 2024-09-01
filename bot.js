@@ -105,8 +105,12 @@ async function main() {
                 console.log(`${requestId} >>> Completed OpenAI run ${run.id} in thread ${openAiThread.id}`);
                 currentRunMap.delete(discordThread.id);
                 const messages = await openai.beta.threads.messages.list(run.thread_id);
+                let handledMessageIdSet = handledMessageIds.get(discordThread.id)
+                if (!handledMessageIdSet) {
+                    handledMessageIdSet = new Set();
+                    handledMessageIds.set(discordThread.id, handledMessageIdSet);
+                }
                 for (const message of messages.data.reverse()) {
-                    const handledMessageIdSet = handledMessageIds.get(discordThread.id) || new Set();
                     if (message.role === 'assistant' && !handledMessageIdSet.has(message.id)) {
                         handledMessageIdSet.add(message.id);
                         console.log(`${requestId} >>> Handling OpenAI message ${message.id} in thread ${openAiThread.id}`);
