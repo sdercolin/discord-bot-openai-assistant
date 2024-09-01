@@ -33,7 +33,7 @@ async function main() {
         console.log(`Ready! Discord logged in as ${readyClient.user.tag}`);
         setInterval(() => {
             cleanupThreads(client)
-        }, 1000);// 3600000);
+        }, 3600000);
     });
 
     client.on('messageCreate', async (triggerMessage) => {
@@ -131,8 +131,7 @@ async function main() {
 }
 
 function cleanupThreads(client) {
-    // const oneDayMs = 24 * 60 * 60 * 1000; // 86400000 milliseconds in a day
-    const oneDayMs = 60000; // testing 60000 milliseconds in a minute
+    const oneDayMs = 24 * 60 * 60 * 1000; // 86400000 milliseconds in a day
     const now = Date.now();
     lastActiveTime.forEach(async (lastActive, threadId) => {
         if (now - lastActive > oneDayMs) {
