@@ -3,6 +3,8 @@ const {Client, Events, GatewayIntentBits} = require('discord.js');
 const OpenAI = require("openai");
 const apiKey = process.env.OPENAI_API_KEY;
 const projectId = process.env.OPENAI_PROJECT_ID;
+const maxMessagesReplays = process.env.MAX_MESSAGES_REPLAYS ? parseInt(process.env.MAX_MESSAGES_REPLAYS) : 30;
+const defaultLanguage = process.env.DEFAULT_LANGUAGE ?? 'en';
 console.log(`Loaded OpenAI API key ${apiKey}`);
 const openai = new OpenAI(
     {
@@ -13,6 +15,9 @@ const openai = new OpenAI(
 
 // save the mapping from discord thread id to openai thread id
 const threadMap = new Map();
+
+// maintain the last tracked message id with key as discord thread id
+const lastTrackedMessageId = new Map();
 
 // maintain the set of OpenAI message ids that have been handled with key as discord thread id
 const handledMessageIds = new Map();
@@ -32,7 +37,7 @@ async function main() {
     client.once(Events.ClientReady, readyClient => {
         console.log(`Ready! Discord logged in as ${readyClient.user.tag}`);
         setInterval(() => {
-            cleanupThreads(client)
+            cleanupThreads()
         }, 3600000);
     });
 
@@ -40,37 +45,44 @@ async function main() {
         try {
             const requestId = triggerMessage.id;
             if (triggerMessage.author.bot) return;
-            // if the message is in the channel, not a thread, only respond when this bot is mentioned, create a thread with
-            // default name and start the conversation with the original message
-            let openAiThread;
+            if (!triggerMessage.mentions.has(client.user.id)) return;
+            // if the message is in the channel, not a thread, create a thread with a default name and start
+            // the conversation with the original message
+            let openAiThread = null;
             let discordThread;
             if (!triggerMessage.channel.isThread()) {
-                if (!triggerMessage.mentions.has(client.user.id)) return;
                 discordThread = await triggerMessage.startThread({name: triggerMessage.content.substring(22)});
-                openAiThread = await openai.beta.threads.create({
-                    messages: [{role: "user", content: triggerMessage.content}],
-                    tool_resources: {
-                        "file_search": {
-                            "vector_store_ids": [process.env.OPENAI_VECTOR_STORE_ID]
-                        }
-                    }
-                });
+                openAiThread = await createOpenAiThread(openai, [triggerMessage]);
                 threadMap.set(discordThread.id, openAiThread.id);
+                lastTrackedMessageId.set(discordThread.id, triggerMessage.id);
                 lastActiveTime.set(discordThread.id, Date.now());
                 console.log(`${requestId} >>> Created OpenAI thread ${openAiThread.id} for message ${triggerMessage.id} with user ${triggerMessage.author.id}`);
             } else {
                 // if the message is in a thread, respond to the message in the thread
                 discordThread = triggerMessage.channel;
                 const openAiThreadId = threadMap.get(discordThread.id);
+
                 if (!openAiThreadId) {
                     console.log(`${requestId} >>> No OpenAI thread found for Discord thread ${discordThread.id}`);
-                    return;
+                } else {
+                    openAiThread = await openai.beta.threads.retrieve(openAiThreadId);
+                    if (!openAiThread) {
+                        console.log(`${requestId} >>> OpenAI thread ${openAiThreadId} not found`);
+                    }
                 }
-                openAiThread = await openai.beta.threads.retrieve(openAiThreadId);
+                let isNewThread = false
                 if (!openAiThread) {
-                    console.log(`${requestId} >>> OpenAI thread ${openAiThreadId} not found`);
-                    return;
+                    const discordMessages = await discordThread.messages.fetch({limit: maxMessagesReplays});
+                    openAiThread = await createOpenAiThread(openai, discordMessages);
+                    isNewThread = true;
+                    threadMap.set(discordThread.id, openAiThread.id);
+                    const latest = discordMessages.first()
+                    if (latest) {
+                        lastTrackedMessageId.set(discordThread.id, latest.id);
+                    }
+                    console.log(`${requestId} >>> Created OpenAI thread ${openAiThread.id} for Discord thread ${discordThread.id} with ${discordMessages.size} messages`);
                 }
+
                 lastActiveTime.set(discordThread.id, Date.now());
                 const currentRunContext = currentRunMap.get(discordThread.id);
                 if (currentRunContext) {
@@ -82,19 +94,49 @@ async function main() {
                         await discordThread.messages.fetch(ongoingMessageId).then(message => message.delete());
                     }
                 }
-                await openai.beta.threads.messages.create(
-                    openAiThreadId,
-                    {
-                        role: "user",
-                        content: triggerMessage.content
+                if (!isNewThread) {
+                    const untrackedMessages = await discordThread.messages.fetch({
+                        limit: maxMessagesReplays,
+                        after: lastTrackedMessageId.get(discordThread.id)
+                    });
+                    if (untrackedMessages.size > 1) {
+                        console.log(`${requestId} >>> Found ${untrackedMessages.size - 1} untracked messages in Discord thread ${discordThread.id}`);
                     }
-                );
-                console.log(`${requestId} >>> Continuing OpenAI thread ${openAiThreadId} with message ${triggerMessage.id} from user ${triggerMessage.author.id}`);
+                    let triggerMessageHandled = false
+                    let count = 0
+                    for (let i = 0; i < untrackedMessages.size; i++) {
+                        const message = untrackedMessages.at(untrackedMessages.size - i - 1);
+                        await openai.beta.threads.messages.create(
+                            openAiThreadId,
+                            convertMessage(message)
+                        );
+                        count++
+                        if (!triggerMessageHandled && message.id === triggerMessage.id) {
+                            triggerMessageHandled = true
+                        }
+                    }
+                    if (!triggerMessageHandled) {
+                        await openai.beta.threads.messages.create(
+                            openAiThreadId,
+                            convertMessage(triggerMessage)
+                        );
+                        count++
+                        lastTrackedMessageId.set(discordThread.id, triggerMessage.id);
+                    } else {
+                        lastTrackedMessageId.set(discordThread.id, untrackedMessages.first().id);
+                    }
+                    if (count > 1) {
+                        console.log(`${requestId} >>> Added ${count - 1} untracked messages to OpenAI thread ${openAiThreadId}`);
+                    }
+                    console.log(`${requestId} >>> Continuing OpenAI thread ${openAiThreadId} with message ${triggerMessage.id}`);
+                }
             }
 
             // create a placeholder message in the thread
-
-            const newMessage = await discordThread.send("Please wait while I process your request...");
+            const placeholder = defaultLanguage === 'ja' ? "リクエストを処理中です。お待ちください..."
+                : "Please wait while I process your request...";
+            const newMessage = await discordThread.send(placeholder);
+            lastTrackedMessageId.set(discordThread.id, newMessage.id);
 
             // continue the conversation
             let run = await openai.beta.threads.runs.create(openAiThread.id, {assistant_id: assistant.id});
@@ -110,15 +152,17 @@ async function main() {
                     handledMessageIdSet = new Set();
                     handledMessageIds.set(discordThread.id, handledMessageIdSet);
                 }
-                for (const message of messages.data.reverse()) {
-                    if (message.role === 'assistant' && !handledMessageIdSet.has(message.id)) {
-                        handledMessageIdSet.add(message.id);
-                        console.log(`${requestId} >>> Handling OpenAI message ${message.id} in thread ${openAiThread.id}`);
-                        for (const block of message.content) {
-                            if (block.type === 'text') {
-                                await newMessage.edit(block.text.value);
-                                console.log(`${requestId} >>> Sent text message ${message.id} to thread ${discordThread.id}`);
-                            }
+                const messageDataList = messages.data.filter(message => message.role === 'assistant' && !handledMessageIdSet.has(message.id))
+                if (messageDataList.length > 0) {
+                    const message = messageDataList[0];
+                    handledMessageIdSet.add(message.id);
+                    console.log(`${requestId} >>> Handling OpenAI message ${message.id} in thread ${openAiThread.id}`);
+                    for (const block of message.content) {
+                        if (block.type === 'text') {
+                            await newMessage.edit(block.text.value);
+                            lastTrackedMessageId.set(discordThread.id, newMessage.id);
+                            console.log(`${requestId} >>> Sent text message ${message.id} to thread ${discordThread.id}`);
+                            break
                         }
                     }
                 }
@@ -134,29 +178,39 @@ async function main() {
     console.log("Logged in to Discord");
 }
 
-function cleanupThreads(client) {
-    const oneDayMs = 24 * 60 * 60 * 1000; // 86400000 milliseconds in a day
+async function cleanupThreads() {
+    const oneDayMs = 24 * 60 * 60 * 1000;
     const now = Date.now();
-    lastActiveTime.forEach(async (lastActive, threadId) => {
+    for (const [threadId, lastActive] of lastActiveTime.entries()) {
         if (now - lastActive > oneDayMs) {
             try {
-                const thread = await client.channels.fetch(threadId);
-                if (thread && thread.isThread()) {
-                    // post a message in the thread and archive it
-                    await thread.send('This conversation has been archived due to inactivity. Please start a new thread if you need further assistance.')
-                    await thread.setArchived(true, 'No activity for one day');
-                    console.log(`Archived thread ${threadId} due to inactivity.`);
-                }
-                // Clear related data
                 const openAiThreadId = threadMap.get(threadId);
+                if (openAiThreadId) {
+                    await openai.beta.threads.del(openAiThreadId);
+                }
                 threadMap.delete(threadId);
                 lastActiveTime.delete(threadId);
                 handledMessageIds.delete(threadId);
                 currentRunMap.delete(threadId);
-                await openai.beta.threads.del(openAiThreadId)
-                console.log(`Deleted OpenAI thread ${openAiThreadId} related to Discord thread ${threadId}`);
+                console.log(`Cleaned up resources for thread ${threadId}`);
             } catch (e) {
-                console.error(e)
+                console.error(`Failed to clean up thread ${threadId}: ${e}`);
+            }
+        }
+    }
+}
+
+function convertMessage(discordMessage) {
+    const role = discordMessage.author.bot ? "assistant" : "user";
+    return {role: role, content: `${discordMessage.author.username}: ${discordMessage.content}`};
+}
+
+function createOpenAiThread(openai, discordMessages) {
+    return openai.beta.threads.create({
+        messages: discordMessages.map((message) => convertMessage(message)).reverse(),
+        tool_resources: {
+            "file_search": {
+                "vector_store_ids": [process.env.OPENAI_VECTOR_STORE_ID]
             }
         }
     });
