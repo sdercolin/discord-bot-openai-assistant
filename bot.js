@@ -159,7 +159,8 @@ async function main() {
                     console.log(`${requestId} >>> Handling OpenAI message ${message.id} in thread ${openAiThread.id}`);
                     for (const block of message.content) {
                         if (block.type === 'text') {
-                            await newMessage.edit(block.text.value);
+                            let newMessageText = await buildMessageContent(openai, block.text);
+                            await newMessage.edit(newMessageText);
                             lastTrackedMessageId.set(discordThread.id, newMessage.id);
                             console.log(`${requestId} >>> Sent text message ${message.id} to thread ${discordThread.id}`);
                             break
@@ -214,6 +215,29 @@ function createOpenAiThread(openai, discordMessages) {
             }
         }
     });
+}
+
+async function buildMessageContent(openai, openaiMessage) {
+    let text = openaiMessage.value
+    let citations = []
+    console.log("building message content: " + JSON.stringify(openaiMessage))
+    for (let i in openaiMessage.annotations) {
+        let index = parseInt(i)
+        const annotation = openaiMessage.annotations[index]
+        if (annotation.type === 'file_citation') {
+            text = text.replace(annotation.text, `[${index + 1}]`)
+            if (annotation.file_citation) {
+                let file = await openai.files.retrieve(annotation.file_citation.file_id)
+                console.log("file citation: " + JSON.stringify(file))
+                citations.push(`[${index + 1}]: ${file.filename}`)
+            }
+        }
+    }
+    let result = text
+    if (citations.length > 0) {
+        result += "\n\nSources: \n" + citations.join("\n")
+    }
+    return result
 }
 
 main();
