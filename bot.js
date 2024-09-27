@@ -51,7 +51,11 @@ async function main() {
             let openAiThread = null;
             let discordThread;
             if (!triggerMessage.channel.isThread()) {
-                discordThread = await triggerMessage.startThread({name: triggerMessage.content.substring(22)});
+                let threadName = triggerMessage.content.substring(22)
+                if (threadName.length > 80) {
+                    threadName = threadName.substring(0, 80) + "..."
+                }
+                discordThread = await triggerMessage.startThread({name: threadName});
                 openAiThread = await createOpenAiThread(openai, [triggerMessage]);
                 threadMap.set(discordThread.id, openAiThread.id);
                 lastTrackedMessageId.set(discordThread.id, triggerMessage.id);
